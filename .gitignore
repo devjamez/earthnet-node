@@ -2,3 +2,5 @@
 
 # node identity seed (secret) written at runtime
 node_key.hex
+# reputation store written at runtime
+reputation.tsv
