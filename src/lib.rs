@@ -12,6 +12,7 @@ pub mod magnitude;
 pub mod persistence;
 pub mod relay_client;
 pub mod server;
+pub mod ttable;
 
 use std::path::Path;
 

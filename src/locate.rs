@@ -1,18 +1,18 @@
 //! Travel-time phase association / hypocenter location.
 //!
 //! Grid-searches the hypocenter (lat, lon, **depth**) + origin time that best
-//! fit P picks under a 1-D layered crustal model with straight rays
-//! (`travel_time`), returning the fit and its RMS residual. A low RMS means the
+//! fit P picks, returning the fit and its RMS residual. A low RMS means the
 //! picks are consistent with one earthquake; a high RMS means they are not
 //! (random coincidence) — that is how association rejects false positives, and
-//! the rejection sharpens as picks become over-determined. The layered model
-//! (vs a single Vp) lets the fit also resolve source depth. Deterministic; no ML
-//! (DESIGN guardrail). Full ray bending (taup-grade) is a later refinement.
+//! the rejection sharpens as picks become over-determined.
+//!
+//! P first-arrival times come from a precomputed **taup (iasp91) table**
+//! ([`travel_time`], [`crate::ttable`]) bilinearly interpolated over distance and
+//! depth — real ray-bending (Pn/Pg head waves), not straight rays. Deterministic;
+//! no ML (DESIGN guardrail).
 
 use crate::geo::haversine_km;
-
-/// 1-D layered P-velocity model: (layer top depth km, velocity km/s).
-const LAYERS: [(f64, f64); 4] = [(0.0, 5.0), (5.0, 6.2), (25.0, 7.0), (60.0, 8.0)];
+use crate::ttable;
 
 /// Candidate source depths (km) for the grid search.
 const DEPTHS_KM: [f64; 7] = [0.0, 5.0, 15.0, 30.0, 50.0, 80.0, 120.0];
@@ -28,31 +28,34 @@ pub struct Hypocenter {
     pub n: usize,
 }
 
-/// Vertical one-way travel time (s) from the surface to `depth_km` through the
-/// layered model.
-fn vertical_time(depth_km: f64) -> f64 {
-    let mut t = 0.0;
-    for (i, &(top, v)) in LAYERS.iter().enumerate() {
-        if top >= depth_km {
-            break;
-        }
-        let bottom = LAYERS.get(i + 1).map(|l| l.0).unwrap_or(f64::INFINITY);
-        let seg = depth_km.min(bottom) - top;
-        if seg > 0.0 {
-            t += seg / v;
-        }
-    }
-    t
-}
-
-/// Straight-ray P travel time (s) from a source at (`epi_km` epicentral
-/// distance, `depth_km` depth) to a surface station.
+/// P first-arrival travel time (s) from a source at (`epi_km` epicentral
+/// distance, `depth_km` depth) to a surface station — bilinear interpolation of
+/// the taup (iasp91) table over (depth, distance).
 pub fn travel_time(epi_km: f64, depth_km: f64) -> f64 {
-    if depth_km <= 0.0 {
-        return epi_km / LAYERS[0].1;
+    let dist_deg = epi_km / ttable::DEG_TO_KM;
+    // distance axis (uniform step). Beyond the table we EXTRAPOLATE on the last
+    // segment's slope (≈ Pn) rather than clamp — clamping would make far-apart
+    // stations share a travel time and look spuriously coherent.
+    let fd = (dist_deg / ttable::DIST_STEP_DEG).max(0.0);
+    let i0 = (fd.floor() as usize).min(ttable::NDIST - 2);
+    let i1 = i0 + 1;
+    let tx = fd - i0 as f64;
+    // depth axis (non-uniform): find bracketing rows
+    let depths = &ttable::DEPTHS_KM;
+    let dc = depth_km.clamp(depths[0], depths[depths.len() - 1]);
+    let mut j0 = 0;
+    while j0 + 1 < depths.len() && depths[j0 + 1] <= dc {
+        j0 += 1;
     }
-    let path = (epi_km * epi_km + depth_km * depth_km).sqrt();
-    path / depth_km * vertical_time(depth_km)
+    let j1 = (j0 + 1).min(depths.len() - 1);
+    let ty = if depths[j1] > depths[j0] {
+        (dc - depths[j0]) / (depths[j1] - depths[j0])
+    } else {
+        0.0
+    };
+    let a = ttable::TT[j0][i0] + (ttable::TT[j0][i1] - ttable::TT[j0][i0]) * tx;
+    let b = ttable::TT[j1][i0] + (ttable::TT[j1][i1] - ttable::TT[j1][i0]) * tx;
+    a + (b - a) * ty
 }
 
 /// Locates the best-fitting hypocenter for picks `(lat, lon, t_ns)`.
