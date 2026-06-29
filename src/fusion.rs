@@ -1,14 +1,12 @@
-//! Fusion + consensus (v0).
-//!
-//! Deliberately minimal for the first node slice — refined in a later slice with
-//! geospatial correlation and time windows. Current rules:
+//! Fusion + consensus (v0.2).
 //!
 //! - OFFICIAL + P-wave: emit a ConfirmedEvent immediately (high trust).
-//! - PHONE: buffer picks; once ≥ N are buffered, emit one consensus ConfirmedEvent
-//!   and clear the buffer.
+//! - PHONE: a pick joins the buffer; it fires consensus only when ≥ N picks fall
+//!   within `radius_km` AND `window` seconds of each other (correlated in space
+//!   and time). Stale picks (outside the window vs the newest) are pruned.
 //!
-//! NOT YET MODELED (later slices): spatial/temporal correlation of phone picks,
-//! deduplication, magnitude estimation, supersede/revision of events.
+//! NOT YET MODELED (later slices): magnitude estimation from the cluster,
+//! epicenter estimation, supersede/revision of events, Sybil/reputation.
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +16,7 @@ use earthnet_protocol::{
 };
 use prost::Message;
 
+use crate::geo::{decode_geohash, haversine_km};
 use crate::{random_id, NodeIdentity};
 
 /// Why an ingested observation was rejected.
@@ -27,14 +26,19 @@ pub enum IngestError {
     Decode,
     /// Signature did not verify.
     Signature,
-    /// Unsupported protocol version or unusable fields.
+    /// Unsupported protocol version, unusable fields, or missing/invalid location.
     BadFields,
 }
 
+struct BufferedPick {
+    lat: f64,
+    lon: f64,
+    t_ns: i64,
+    obs: Observation,
+}
+
 struct State {
-    /// Buffered phone picks awaiting consensus.
-    phone_buffer: Vec<Observation>,
-    /// Events emitted so far (inspection / tests).
+    phone_buffer: Vec<BufferedPick>,
     emitted: Vec<ConfirmedEvent>,
 }
 
@@ -42,15 +46,24 @@ struct State {
 pub struct Fusion {
     identity: NodeIdentity,
     consensus_n: usize,
+    radius_km: f64,
+    window_ns: i64,
     state: Mutex<State>,
 }
 
 impl Fusion {
-    /// `consensus_n` = how many phone picks trigger a consensus event.
-    pub fn new(identity: NodeIdentity, consensus_n: usize) -> Self {
+    /// `consensus_n` phone picks within `radius_km` and `window_secs` trigger consensus.
+    pub fn new(
+        identity: NodeIdentity,
+        consensus_n: usize,
+        radius_km: f64,
+        window_secs: u64,
+    ) -> Self {
         Self {
             identity,
             consensus_n: consensus_n.max(1),
+            radius_km: radius_km.max(0.0),
+            window_ns: (window_secs as i64).saturating_mul(1_000_000_000),
             state: Mutex::new(State {
                 phone_buffer: Vec::new(),
                 emitted: Vec::new(),
@@ -71,28 +84,68 @@ impl Fusion {
             return Err(IngestError::BadFields);
         }
 
-        let mut st = self.state.lock().expect("fusion state poisoned");
         let event = match SourceType::try_from(obs.source_type) {
             Ok(SourceType::Official) if obs.p_wave_detected => {
                 Some(self.make_event(&[obs], EvidenceKind::Official))
             }
-            Ok(SourceType::Official) => None, // official but no P-wave yet
-            Ok(SourceType::Phone) => {
-                st.phone_buffer.push(obs);
-                if st.phone_buffer.len() >= self.consensus_n {
-                    let picks = std::mem::take(&mut st.phone_buffer);
-                    Some(self.make_event(&picks, EvidenceKind::Consensus))
-                } else {
-                    None
-                }
-            }
+            Ok(SourceType::Official) => None,
+            Ok(SourceType::Phone) => self.ingest_phone(obs)?,
             _ => return Err(IngestError::BadFields),
         };
 
         if let Some(ref evt) = event {
-            st.emitted.push(evt.clone());
+            self.state
+                .lock()
+                .expect("fusion state poisoned")
+                .emitted
+                .push(evt.clone());
         }
         Ok(event)
+    }
+
+    /// Buffers a phone pick and fires consensus if a correlated cluster forms.
+    fn ingest_phone(&self, obs: Observation) -> Result<Option<ConfirmedEvent>, IngestError> {
+        let (lat, lon) = obs
+            .location
+            .as_ref()
+            .and_then(|l| decode_geohash(&l.geohash))
+            .ok_or(IngestError::BadFields)?;
+        let t_ns = obs.captured_at_ns;
+
+        let mut st = self.state.lock().expect("fusion state poisoned");
+
+        // Drop picks too far in time from this one, then add it.
+        st.phone_buffer
+            .retain(|p| (p.t_ns - t_ns).abs() <= self.window_ns);
+        st.phone_buffer.push(BufferedPick {
+            lat,
+            lon,
+            t_ns,
+            obs,
+        });
+
+        // Partition the buffer into the cluster correlated with the new pick and the rest.
+        let mut clustered = Vec::new();
+        let mut rest = Vec::new();
+        for p in st.phone_buffer.drain(..) {
+            let near = haversine_km((lat, lon), (p.lat, p.lon)) <= self.radius_km
+                && (p.t_ns - t_ns).abs() <= self.window_ns;
+            if near {
+                clustered.push(p);
+            } else {
+                rest.push(p);
+            }
+        }
+        st.phone_buffer = rest;
+
+        if clustered.len() >= self.consensus_n {
+            let picks: Vec<Observation> = clustered.into_iter().map(|p| p.obs).collect();
+            Ok(Some(self.make_event(&picks, EvidenceKind::Consensus)))
+        } else {
+            // not enough yet — keep the cluster buffered
+            st.phone_buffer.extend(clustered);
+            Ok(None)
+        }
     }
 
     /// Number of events emitted so far.

@@ -22,18 +22,23 @@ POST /observations    body = Observation protobuf
 GET  /health → "ok"
 ```
 
+Phone consensus is **spatial + temporal**: ≥ N picks within `radius_km` and
+`window_s` of each other (correlated by decoded geohash + capture time).
+
 ## Run
 
 ```sh
 cargo run
-# env: EARTHNET_NODE_ADDR (default 127.0.0.1:8080), EARTHNET_CONSENSUS_N (default 3)
+# env: EARTHNET_NODE_ADDR (127.0.0.1:8080), EARTHNET_CONSENSUS_N (3),
+#      EARTHNET_CONSENSUS_RADIUS_KM (100), EARTHNET_CONSENSUS_WINDOW_S (30),
+#      EARTHNET_NODE_KEY_FILE (node_key.hex), EARTHNET_NODE_KEY (hex seed, overrides file)
 ```
 
 ## Status
 
-🟡 v0.1 — first vertical slice: HTTP ingest + signature verification + minimal
-fusion. NOT yet modeled: geospatial/temporal consensus correlation, magnitude
-estimation, event revision, relay fan-out, identity persistence.
+🟡 v0.2 — HTTP ingest + signature verification + spatial/temporal consensus +
+persisted identity. NOT yet modeled: magnitude/epicenter estimation, event
+revision, relay fan-out wiring, Sybil/reputation.
 
 ## License
 

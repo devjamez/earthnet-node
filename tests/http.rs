@@ -12,7 +12,12 @@ use rand::{rngs::OsRng, RngCore};
 use tower::ServiceExt; // for `oneshot`
 
 fn router() -> axum::Router {
-    app(Arc::new(Fusion::new(NodeIdentity::ephemeral(), 3)))
+    app(Arc::new(Fusion::new(
+        NodeIdentity::ephemeral(),
+        3,
+        100.0,
+        30,
+    )))
 }
 
 fn signed_official_bytes() -> Vec<u8> {
