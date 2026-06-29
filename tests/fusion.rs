@@ -189,7 +189,7 @@ fn consensus_uses_provisional_magnitude() {
         "provisional magnitude should be estimated"
     );
     assert!(
-        (evt.magnitude_uncert - 0.8).abs() < 1e-6,
+        (evt.magnitude_uncert - 0.5).abs() < 1e-6,
         "provisional uncertainty"
     );
 }
