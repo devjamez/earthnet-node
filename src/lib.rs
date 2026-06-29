@@ -11,6 +11,7 @@ pub mod locate;
 pub mod magnitude;
 pub mod persistence;
 pub mod relay_client;
+pub mod reputation;
 pub mod server;
 pub mod ttable;
 

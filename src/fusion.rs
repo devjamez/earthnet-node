@@ -16,9 +16,9 @@
 //! Consensus is reputation-weighted: the inlier identities' summed weight must
 //! reach `min_weight` (default = N fresh votes); inliers gain reputation, so
 //! established sensors count for more (Sybil-resistance lever via `min_weight`).
+//! Reputation time-decays and persists to disk (see [`crate::reputation`]).
 //!
-//! NOT YET MODELED (later slices): calibrated GMPE coefficients, reputation
-//! persistence/decay.
+//! NOT YET MODELED (later slices): calibrated GMPE coefficients.
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,10 +28,12 @@ use earthnet_protocol::{
 };
 use prost::Message;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::geo::{decode_geohash, encode_geohash, haversine_km};
 use crate::locate::{associate_window, Hypocenter};
+use crate::reputation::Reputation;
 use crate::{magnitude, random_id, NodeIdentity};
 
 /// Max RMS travel-time residual (s) for an associated event to be accepted.
@@ -39,12 +41,6 @@ const MAX_RMS_S: f64 = 1.0;
 /// Inlier threshold (s): a pick joins the associated event if its implied origin
 /// is within this of the cluster's median origin.
 const RESIDUAL_TOL_S: f64 = 1.5;
-/// Reputation weight of an unknown/new identity.
-const DEFAULT_WEIGHT: f64 = 1.0;
-/// Reputation cap.
-const MAX_WEIGHT: f64 = 5.0;
-/// Reputation gained by an identity each time its pick is an inlier of a fire.
-const REWARD: f64 = 0.5;
 
 /// Why an ingested observation was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +71,7 @@ struct EmittedRef {
 struct State {
     phone_buffer: Vec<BufferedPick>,
     recent: Vec<EmittedRef>,
-    reputation: HashMap<Vec<u8>, f64>,
+    reputation: Reputation,
     emitted_count: usize,
 }
 
@@ -86,6 +82,7 @@ pub struct Fusion {
     radius_km: f64,
     window_ns: i64,
     min_weight: f64,
+    reputation_path: Option<PathBuf>,
     state: Mutex<State>,
 }
 
@@ -106,10 +103,11 @@ impl Fusion {
             window_ns: (window_secs as i64).saturating_mul(1_000_000_000),
             // default: fresh identities (weight 1.0) behave like count >= N
             min_weight: consensus_n as f64,
+            reputation_path: None,
             state: Mutex::new(State {
                 phone_buffer: Vec::new(),
                 recent: Vec::new(),
-                reputation: HashMap::new(),
+                reputation: Reputation::new(),
                 emitted_count: 0,
             }),
         }
@@ -123,15 +121,21 @@ impl Fusion {
         self
     }
 
-    /// Current reputation weight of an identity (default for unknown).
+    /// Loads persisted reputation from `path` and keeps saving to it after each
+    /// confirmed event.
+    pub fn with_reputation_file(mut self, path: PathBuf) -> Self {
+        self.state.lock().expect("fusion state poisoned").reputation = Reputation::load(&path);
+        self.reputation_path = Some(path);
+        self
+    }
+
+    /// Current (decayed) reputation weight of an identity.
     pub fn reputation_of(&self, pubkey: &[u8]) -> f64 {
         self.state
             .lock()
             .expect("fusion state poisoned")
             .reputation
-            .get(pubkey)
-            .copied()
-            .unwrap_or(DEFAULT_WEIGHT)
+            .weight(pubkey, now_ns())
     }
 
     /// Decode + verify + ingest raw Observation bytes.
@@ -203,6 +207,7 @@ impl Fusion {
         match associate_window(&coords, self.consensus_n, RESIDUAL_TOL_S, span_deg) {
             Some((h, inliers)) if h.rms_s <= MAX_RMS_S => {
                 let inset: HashSet<usize> = inliers.into_iter().collect();
+                let now = now_ns();
                 // Reputation-weighted gate: the inlier identities' summed weight
                 // must reach `min_weight` (>= count of fresh identities by default).
                 let weight: f64 = st
@@ -210,12 +215,7 @@ impl Fusion {
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| inset.contains(i))
-                    .map(|(_, p)| {
-                        st.reputation
-                            .get(&p.obs.pubkey)
-                            .copied()
-                            .unwrap_or(DEFAULT_WEIGHT)
-                    })
+                    .map(|(_, p)| st.reputation.weight(&p.obs.pubkey, now))
                     .sum();
                 if weight < self.min_weight {
                     return Ok(None); // coherent geometry but insufficient trust
@@ -230,13 +230,12 @@ impl Fusion {
                     }
                 }
                 st.phone_buffer = keep;
-                // Reward the contributing identities (capped).
+                // Reward the contributing identities, then persist (best-effort).
                 for p in &picks {
-                    let w = st
-                        .reputation
-                        .entry(p.pubkey.clone())
-                        .or_insert(DEFAULT_WEIGHT);
-                    *w = (*w + REWARD).min(MAX_WEIGHT);
+                    st.reputation.reward(&p.pubkey, now);
+                }
+                if let Some(path) = &self.reputation_path {
+                    let _ = st.reputation.save(path);
                 }
                 Ok(Some((picks, h)))
             }
