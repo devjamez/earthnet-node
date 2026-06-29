@@ -1,4 +1,5 @@
 use earthnet_node::fusion::{Fusion, IngestError};
+use earthnet_node::geo::{decode_geohash, encode_geohash, haversine_km};
 use earthnet_node::NodeIdentity;
 use earthnet_protocol::{
     sign, verify, EvidenceKind, Location, Observation, SourceType, PROTOCOL_VERSION,
@@ -78,6 +79,25 @@ fn phone_signed_by(key: &SigningKey, geohash: &str, t_ns: i64) -> Observation {
 fn fusion() -> Fusion {
     Fusion::new(NodeIdentity::ephemeral(), 3, 100.0, 30)
 }
+
+fn key() -> SigningKey {
+    let mut s = [0u8; 32];
+    OsRng.fill_bytes(&mut s);
+    SigningKey::from_bytes(&s)
+}
+
+fn phone_at(lat: f64, lon: f64, t_ns: i64) -> Observation {
+    phone_signed_by(&key(), &encode_geohash(lat, lon, 7), t_ns)
+}
+
+const VP: f64 = 6.0;
+// four stations within ~100 km of each other
+const CLUSTER: [(f64, f64); 4] = [
+    (-21.0, -69.5),
+    (-21.2, -69.7),
+    (-20.8, -69.6),
+    (-21.1, -69.35),
+];
 
 #[test]
 fn official_with_pwave_emits_signed_event() {
@@ -235,6 +255,46 @@ fn distant_event_does_not_supersede() {
         .unwrap()
         .unwrap();
     assert!(e2.supersedes.is_empty(), "far-away event is independent");
+}
+
+#[test]
+fn association_locates_and_fires_consistent_cluster() {
+    let f = Fusion::new(NodeIdentity::ephemeral(), 4, 100.0, 30);
+    let src = (-21.05, -69.55);
+    let origin_s = 1_700_000_000.0;
+    let mut evt = None;
+    for &(la, lo) in &CLUSTER {
+        let t = origin_s + haversine_km(src, (la, lo)) / VP;
+        evt = f.ingest(phone_at(la, lo, (t * 1e9) as i64)).unwrap();
+    }
+    let e = evt.expect("4 coherent picks must associate and fire");
+    assert_eq!(e.evidence, EvidenceKind::Consensus as i32);
+    assert_eq!(e.num_observations, 4);
+    let (elat, elon) = decode_geohash(&e.epicenter.as_ref().unwrap().geohash).unwrap();
+    assert!(
+        haversine_km((elat, elon), src) < 40.0,
+        "located epicenter too far from source"
+    );
+    assert!(verify(&e).is_ok());
+}
+
+#[test]
+fn association_rejects_incoherent_cluster() {
+    let f = Fusion::new(NodeIdentity::ephemeral(), 4, 100.0, 30);
+    let src = (-21.05, -69.55);
+    let origin_s = 1_700_000_000.0;
+    let mut last = None;
+    for (i, &(la, lo)) in CLUSTER.iter().enumerate() {
+        let mut t = origin_s + haversine_km(src, (la, lo)) / VP;
+        if i == 0 {
+            t += 6.0; // one badly mistimed pick — no single source fits
+        }
+        last = f.ingest(phone_at(la, lo, (t * 1e9) as i64)).unwrap();
+    }
+    assert!(
+        last.is_none(),
+        "an incoherent cluster must be rejected by association"
+    );
 }
 
 #[test]

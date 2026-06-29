@@ -1,17 +1,20 @@
-//! Fusion + consensus (v0.3).
+//! Fusion + consensus (v0.4).
 //!
 //! - OFFICIAL + P-wave: emit a ConfirmedEvent immediately (high trust).
-//! - PHONE: a pick joins the buffer; consensus fires only when ≥ N picks from
-//!   DISTINCT identities fall within `radius_km` AND `window` seconds of each
-//!   other. One pubkey counts once (basic Sybil resistance) — a single identity
-//!   resending cannot manufacture consensus.
+//! - PHONE: a pick joins the buffer; a coarse cluster forms from ≥ N picks of
+//!   DISTINCT identities within `radius_km` AND `window` seconds (one pubkey =
+//!   one vote — basic Sybil resistance). The cluster then must pass travel-time
+//!   **phase association** ([`crate::locate`]): the picks must fit a single
+//!   hypocenter within an RMS tolerance, which rejects incoherent coincidences
+//!   (sharpening as picks become over-determined) and yields the real epicenter
+//!   + origin time. Official events use the pick's own location + time.
 //!
-//! Epicenter = centroid of contributing picks. Magnitude = official value if
-//! reported, else a provisional PGA-based estimate (see `magnitude`). A new event
-//! that correlates with a recently emitted one carries `supersedes` (revision).
+//! Magnitude = official value if reported, else a provisional PGA-based estimate
+//! (see `magnitude`). A new event correlated with a recent one carries
+//! `supersedes` (revision).
 //!
 //! NOT YET MODELED (later slices): depth estimation, calibrated GMPE
-//! coefficients, reputation-weighted consensus.
+//! coefficients, reputation-weighted consensus, layered velocity model.
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +25,13 @@ use earthnet_protocol::{
 use prost::Message;
 
 use crate::geo::{decode_geohash, encode_geohash, haversine_km};
+use crate::locate::{locate, Hypocenter, VP_KM_S};
 use crate::{magnitude, random_id, NodeIdentity};
+
+/// Max RMS travel-time residual (s) for a phone cluster to be accepted as one
+/// earthquake. With > N picks this rejects coincidental noise; at exactly N=3
+/// the fit is exact so it mainly yields the located epicenter/origin.
+const MAX_RMS_S: f64 = 2.0;
 
 /// Why an ingested observation was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,23 +109,26 @@ impl Fusion {
             return Err(IngestError::BadFields);
         }
 
-        let to_emit: Option<(Vec<Observation>, EvidenceKind)> =
+        let to_emit: Option<(Vec<Observation>, EvidenceKind, Option<Hypocenter>)> =
             match SourceType::try_from(obs.source_type) {
                 Ok(SourceType::Official) if obs.p_wave_detected => {
-                    Some((vec![obs], EvidenceKind::Official))
+                    Some((vec![obs], EvidenceKind::Official, None))
                 }
                 Ok(SourceType::Official) => None,
-                Ok(SourceType::Phone) => self
-                    .cluster_phone(obs)?
-                    .map(|picks| (picks, EvidenceKind::Consensus)),
+                Ok(SourceType::Phone) => match self.cluster_phone(obs)? {
+                    Some(picks) => {
+                        associate(&picks).map(|h| (picks, EvidenceKind::Consensus, Some(h)))
+                    }
+                    None => None,
+                },
                 _ => return Err(IngestError::BadFields),
             };
 
-        let Some((picks, evidence)) = to_emit else {
+        let Some((picks, evidence, hypo)) = to_emit else {
             return Ok(None);
         };
         let mut st = self.state.lock().expect("fusion state poisoned");
-        Ok(Some(self.build_and_record(&mut st, &picks, evidence)))
+        Ok(Some(self.build_and_record(&mut st, &picks, evidence, hypo)))
     }
 
     /// Buffers a phone pick (one vote per identity) and returns the correlated
@@ -180,10 +192,24 @@ impl Fusion {
         st: &mut State,
         picks: &[Observation],
         evidence: EvidenceKind,
+        located: Option<Hypocenter>,
     ) -> ConfirmedEvent {
-        let lead = &picks[0];
-        let origin_time_ns = lead.captured_at_ns;
-        let (epicenter, centroid) = estimate_epicenter(picks);
+        // Located hypocenter (consensus) gives real epicenter + origin time;
+        // otherwise (official single pick) fall back to centroid + pick time.
+        let (epicenter, centroid, origin_time_ns) = match located {
+            Some(h) => (
+                Some(Location {
+                    geohash: encode_geohash(h.lat, h.lon, 6),
+                    precision_m: 600,
+                }),
+                Some((h.lat, h.lon)),
+                h.origin_ns,
+            ),
+            None => {
+                let (epi, c) = estimate_epicenter(picks);
+                (epi, c, picks[0].captured_at_ns)
+            }
+        };
         let (magnitude, magnitude_uncert) = estimate_magnitude(picks, centroid);
 
         // Supersede a recent correlated event, if any.
@@ -235,6 +261,25 @@ impl Fusion {
                     && (origin_time_ns - e.origin_time_ns).abs() <= self.window_ns
             })
             .map(|e| e.event_id.clone())
+    }
+}
+
+/// Travel-time phase association: locate a common hypocenter from the cluster's
+/// P picks; accept only if the RMS residual is within tolerance (picks fit one
+/// earthquake). Returns None to reject the cluster as not a single source.
+fn associate(picks: &[Observation]) -> Option<Hypocenter> {
+    let coords: Vec<(f64, f64, i64)> = picks
+        .iter()
+        .filter_map(|p| {
+            p.location
+                .as_ref()
+                .and_then(|l| decode_geohash(&l.geohash))
+                .map(|(la, lo)| (la, lo, p.captured_at_ns))
+        })
+        .collect();
+    match locate(&coords, VP_KM_S) {
+        Some(h) if h.rms_s <= MAX_RMS_S => Some(h),
+        _ => None,
     }
 }
 
