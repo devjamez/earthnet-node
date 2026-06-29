@@ -118,10 +118,9 @@ impl Fusion {
                     Some((vec![obs], EvidenceKind::Official, None))
                 }
                 Ok(SourceType::Official) => None,
-                Ok(SourceType::Phone) => match self.window_associate(obs)? {
-                    Some((picks, h)) => Some((picks, EvidenceKind::Consensus, Some(h))),
-                    None => None,
-                },
+                Ok(SourceType::Phone) => self
+                    .window_associate(obs)?
+                    .map(|(picks, h)| (picks, EvidenceKind::Consensus, Some(h))),
                 _ => return Err(IngestError::BadFields),
             };
 

@@ -132,7 +132,16 @@ pub fn associate_window(
     let step = (span_deg / 12.0).max(0.02);
     let steps = (2.0 * span_deg / step) as i64;
 
-    let mut best: Option<(usize, f64, f64, f64, f64, f64, Vec<usize>)> = None;
+    struct Cand {
+        count: usize,
+        rms: f64,
+        lat: f64,
+        lon: f64,
+        depth: f64,
+        origin: f64,
+        inliers: Vec<usize>,
+    }
+    let mut best: Option<Cand> = None;
     for i in 0..=steps {
         let la = clat - span_deg + i as f64 * step;
         for j in 0..=steps {
@@ -158,25 +167,33 @@ pub fn associate_window(
                 let rms = (ss / inliers.len() as f64).sqrt();
                 let better = match &best {
                     None => true,
-                    Some(b) => inliers.len() > b.0 || (inliers.len() == b.0 && rms < b.1),
+                    Some(b) => inliers.len() > b.count || (inliers.len() == b.count && rms < b.rms),
                 };
                 if better {
-                    best = Some((inliers.len(), rms, la, lo, depth, origin, inliers));
+                    best = Some(Cand {
+                        count: inliers.len(),
+                        rms,
+                        lat: la,
+                        lon: lo,
+                        depth,
+                        origin,
+                        inliers,
+                    });
                 }
             }
         }
     }
-    best.map(|(n, rms, la, lo, depth, origin, inliers)| {
+    best.map(|c| {
         (
             Hypocenter {
-                lat: la,
-                lon: lo,
-                depth_km: depth,
-                origin_ns: t0 + (origin * 1e9) as i64,
-                rms_s: rms,
-                n,
+                lat: c.lat,
+                lon: c.lon,
+                depth_km: c.depth,
+                origin_ns: t0 + (c.origin * 1e9) as i64,
+                rms_s: c.rms,
+                n: c.count,
             },
-            inliers,
+            c.inliers,
         )
     })
 }
