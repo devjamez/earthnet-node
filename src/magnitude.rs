@@ -6,15 +6,15 @@
 //!
 //!   M ≈ A·log10(PGA[cm/s²]) + B·log10(R[km]) + C
 //!
-//! Coefficients CALIBRATED by least squares from 48 real CX strong-motion records
-//! (instrument response removed) of M5.0–5.8 northern-Chile earthquakes, 2023–24
-//! (backtest/calibrate_gmpe.py); in-sample residual RMS ≈ 0.15 mag. Caveat: the
-//! calibration magnitude range is narrow, so estimates outside ~M5 are less
-//! certain — recalibrate with a wider catalog. Still reported with uncertainty.
+//! Coefficients CALIBRATED by least squares from 123 real CX strong-motion
+//! records (instrument response removed) spanning M4.0–8.2 northern-Chile
+//! earthquakes, 2011–2025 (backtest/calibrate_gmpe.py); residual RMS ≈ 0.41 mag
+//! — the honest scatter of single-station PGA→M. First-order only; reported with
+//! the matching uncertainty.
 
-const A: f64 = 0.1825;
-const B: f64 = 0.6666;
-const C: f64 = 3.8335;
+const A: f64 = 1.0104;
+const B: f64 = 2.6964;
+const C: f64 = -1.3988;
 const G_TO_CM_S2: f64 = 980.665;
 
 /// Provisional magnitude from PGA (in g) and hypocentral distance (km).
@@ -29,9 +29,9 @@ pub fn estimate_from_pga(pga_g: f32, distance_km: f64) -> f32 {
     m.clamp(0.0, 10.0) as f32
 }
 
-/// Uncertainty (magnitude units) attached to a provisional PGA estimate.
-/// Above the in-sample fit RMS to reflect out-of-calibration-range uncertainty.
-pub const PROVISIONAL_UNCERT: f32 = 0.5;
+/// Uncertainty (magnitude units) attached to a provisional PGA estimate —
+/// the calibration residual RMS over M4–8.2.
+pub const PROVISIONAL_UNCERT: f32 = 0.41;
 /// Uncertainty attached to an authoritative official magnitude.
 pub const OFFICIAL_UNCERT: f32 = 0.2;
 
