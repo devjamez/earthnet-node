@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use earthnet_protocol::{verify, Observation};
+use earthnet_protocol::{compat::observation_from_signal, verify, Observation, Signal};
 use prost::Message as _;
 
 use std::time::Instant;
@@ -34,7 +34,8 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics_handler))
-        .route("/observations", post(ingest))
+        .route("/observations", post(ingest)) // v0.1 Observation
+        .route("/signals", post(ingest_signal)) // v0.2 Signal (dual-stack)
         .with_state(state)
 }
 
@@ -53,10 +54,10 @@ async fn metrics_handler() -> impl axum::response::IntoResponse {
     )
 }
 
-/// Accepts one Observation (raw protobuf body):
-///   202 Accepted        — verified, persisted, ingested
-///   400 Bad Request     — undecodable / bad fields
-///   401 Unauthorized    — signature failed
+/// v0.1: accepts one signed `Observation` (raw protobuf body).
+///   202 Accepted     — verified, persisted, ingested
+///   400 Bad Request  — undecodable / bad fields
+///   401 Unauthorized — signature failed
 async fn ingest(State(state): State<AppState>, body: Bytes) -> StatusCode {
     let start = Instant::now();
     let m = metrics();
@@ -71,6 +72,41 @@ async fn ingest(State(state): State<AppState>, body: Bytes) -> StatusCode {
         m.ingest_errors.with_label_values(&["signature"]).inc();
         return StatusCode::UNAUTHORIZED;
     }
+    let code = process_observation(&state, obs);
+    m.ingest_seconds.observe(start.elapsed().as_secs_f64());
+    code
+}
+
+/// v0.2 (dual-stack): accepts a signed `Signal`. A seismic-pick Signal is
+/// normalized into the internal Observation and fed to the same fusion engine;
+/// other modalities are accepted but not (yet) routed to the seismic alert path.
+async fn ingest_signal(State(state): State<AppState>, body: Bytes) -> StatusCode {
+    let start = Instant::now();
+    let m = metrics();
+    let sig = match Signal::decode(body.as_ref()) {
+        Ok(s) => s,
+        Err(_) => {
+            m.ingest_errors.with_label_values(&["decode"]).inc();
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    if verify(&sig).is_err() {
+        m.ingest_errors.with_label_values(&["signature"]).inc();
+        return StatusCode::UNAUTHORIZED;
+    }
+    let code = match observation_from_signal(&sig) {
+        Some(obs) => process_observation(&state, obs),
+        // non-seismic modality: accepted for the research plane; alert path is seismic-only for now
+        None => StatusCode::ACCEPTED,
+    };
+    m.ingest_seconds.observe(start.elapsed().as_secs_f64());
+    code
+}
+
+/// Shared path for a verified pick (from either wire version): persist, fuse,
+/// and forward any resulting ConfirmedEvent. Synchronous (no I/O awaits).
+fn process_observation(state: &AppState, obs: Observation) -> StatusCode {
+    let m = metrics();
     m.observations
         .with_label_values(&[&obs.source_type.to_string()])
         .inc();
@@ -78,7 +114,7 @@ async fn ingest(State(state): State<AppState>, body: Bytes) -> StatusCode {
     // Persist every verified observation (async, off the hot path).
     state.persistence.record_observation(obs.clone());
 
-    let code = match state.fusion.ingest(obs) {
+    match state.fusion.ingest(obs) {
         Ok(Some(event)) => {
             m.events
                 .with_label_values(&[&event.evidence.to_string()])
@@ -100,7 +136,5 @@ async fn ingest(State(state): State<AppState>, body: Bytes) -> StatusCode {
         }
         // signature already checked above; any decode/other error is a bad request
         Err(IngestError::Decode | IngestError::Signature) => StatusCode::BAD_REQUEST,
-    };
-    m.ingest_seconds.observe(start.elapsed().as_secs_f64());
-    code
+    }
 }

@@ -59,6 +59,59 @@ async fn health_ok() {
     assert_eq!(&body[..], b"ok");
 }
 
+fn signed_signal_bytes() -> Vec<u8> {
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let key = SigningKey::from_bytes(&secret);
+    let obs = Observation {
+        protocol_version: PROTOCOL_VERSION,
+        observation_id: vec![2u8; 16],
+        pubkey: key.verifying_key().to_bytes().to_vec(),
+        source_type: SourceType::Official as i32,
+        source_id: "CX:PB01".into(),
+        captured_at_ns: 1_700_000_000_000_000_000,
+        clock_uncert_ms: 5,
+        location: Some(Location {
+            geohash: "66jd2".into(),
+            precision_m: 100,
+        }),
+        sta_lta_ratio: 12.0,
+        p_wave_detected: true,
+        estimated_pga: 0.05,
+        reported_magnitude: 6.0,
+        signature: Vec::new(),
+    };
+    let mut sig = earthnet_protocol::compat::signal_from_observation(&obs);
+    earthnet_protocol::sign(&key, &mut sig);
+    sig.encode_to_vec()
+}
+
+#[tokio::test]
+async fn post_valid_v02_signal_accepted() {
+    // dual-stack: a v0.2 Signal{seismic.pick.v1} normalizes and fires like v0.1
+    let resp = router()
+        .oneshot(
+            Request::post("/signals")
+                .body(Body::from(signed_signal_bytes()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn post_tampered_signal_unauthorized() {
+    let mut bytes = signed_signal_bytes();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    let resp = router()
+        .oneshot(Request::post("/signals").body(Body::from(bytes)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn metrics_endpoint_exposes_prometheus() {
     let app = router();
