@@ -1,8 +1,8 @@
-> 🌎 Part of **[EarthNet](https://github.com/devjamez/earthnet)** — open-source, decentralized earthquake early warning for Latin America.
+> 🌎 Part of **[EarthNet](https://github.com/EarthNet-EEW/earthnet)** — open-source, decentralized earthquake early warning for Latin America.
 
 # earthnet-node
 
-Node for the [EarthNet](https://github.com/devjamez/earthnet-protocol) earthquake
+Node for the [EarthNet](https://github.com/EarthNet-EEW/earthnet-protocol) earthquake
 early-warning network. Ingests signed `Observation`s from country adapters and
 sensors, fuses them + reaches consensus, and emits signed `ConfirmedEvent`s that
 trigger client alarms.
